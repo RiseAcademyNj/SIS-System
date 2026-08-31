@@ -64,10 +64,9 @@ const SHEET_ID = (() => {
   return id;
 })();
 
-// If the requested tab name doesn't exist, Google's CSV export endpoint
-// doesn't error — it silently serves a *different* tab (200 OK, content-type
-// text/csv) instead. res.ok/content-type alone can't detect that, so each
-// caller checks for header columns that only that tab should have.
+// Sanity check on top of the gid-based lookup below (which already pins an
+// exact tab by id, so it can't silently drift to the wrong tab the way a
+// name-based lookup could) — still useful to catch a renamed/missing column.
 function assertTabShape(tabName: string, headers: string[]): void {
   const has = (name: string) => headers.includes(name);
   const looksRight =
@@ -85,11 +84,44 @@ function assertTabShape(tabName: string, headers: string[]): void {
   }
 }
 
-async function fetchTabRows(tabName: string): Promise<Record<string, string>[]> {
-  const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tabName)}`;
+// Maps tab name -> gid by scraping the sheet's public "htmlview" page, which
+// embeds a bootstrap script listing every tab as
+// `{name: "Tab Name", pageUrl: "...", gid: "123456"}`. This is undocumented
+// but has been stable for a long time; if Google ever changes this markup,
+// every tab lookup below will start failing with a clear "couldn't find tab"
+// error rather than silently mismatching data.
+async function fetchTabGids(): Promise<Map<string, string>> {
+  const res = await fetch(`https://docs.google.com/spreadsheets/d/${SHEET_ID}/htmlview`);
+  if (!res.ok) {
+    throw new Error(
+      `Couldn't read the sheet's tab list. Make sure the sheet is shared as "Anyone with the link" (Viewer).`
+    );
+  }
+  const html = await res.text();
+  const gids = new Map<string, string>();
+  for (const match of html.matchAll(/\{name: "([^"]*)", pageUrl: "[^"]*", gid: "(\d+)"/g)) {
+    gids.set(match[1], match[2]);
+  }
+  return gids;
+}
+
+// The gviz "tq" query endpoint (`/gviz/tq?tqx=out:csv&sheet=<name>`) silently
+// caps its result at a small number of rows on large sheets — no error, no
+// truncation warning, just a partial CSV. Confirmed on a ~3800-row sheet: it
+// returned only 41 rows. The plain `/export?format=csv&gid=<gid>` endpoint
+// does a real full-tab dump instead, so that's used here despite needing an
+// extra request (fetchTabGids) to resolve tab name -> gid, since tabs are
+// still identified by name everywhere else in this app for no-setup sharing.
+async function fetchTabRows(tabName: string, gids: Map<string, string>): Promise<Record<string, string>[]> {
+  const gid = gids.get(tabName);
+  if (gid === undefined) {
+    throw new Error(
+      `Couldn't find a tab named exactly "${tabName}". Make sure the sheet is shared as "Anyone with the link" (Viewer) and has a tab named exactly "${tabName}".`
+    );
+  }
+  const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${gid}`;
   const res = await fetch(url);
-  const contentType = res.headers.get("content-type") ?? "";
-  if (!res.ok || !contentType.includes("csv")) {
+  if (!res.ok) {
     throw new Error(
       `Couldn't read the "${tabName}" tab. Make sure the sheet is shared as "Anyone with the link" (Viewer) and has a tab named exactly "${tabName}".`
     );
@@ -121,8 +153,8 @@ function parseWeekOfDate(raw: string): number | null {
   return Number.isNaN(parsed) ? null : parsed;
 }
 
-async function loadAdmins(): Promise<AdminEntry[]> {
-  const rows = await fetchTabRows("Admins");
+async function loadAdmins(gids: Map<string, string>): Promise<AdminEntry[]> {
+  const rows = await fetchTabRows("Admins", gids);
   const entries: AdminEntry[] = [];
   for (const row of rows) {
     const username = get(row, "Username");
@@ -132,8 +164,8 @@ async function loadAdmins(): Promise<AdminEntry[]> {
   return entries;
 }
 
-async function loadRoster(): Promise<RosterEntry[]> {
-  const rows = await fetchTabRows("Student Roster");
+async function loadRoster(gids: Map<string, string>): Promise<RosterEntry[]> {
+  const rows = await fetchTabRows("Student Roster", gids);
   const entries: RosterEntry[] = [];
   for (const row of rows) {
     const studentId = get(row, "Student ID");
@@ -149,8 +181,8 @@ async function loadRoster(): Promise<RosterEntry[]> {
   return entries;
 }
 
-async function loadWeekly(): Promise<WeeklyEntry[]> {
-  const rows = await fetchTabRows("Weekly Programs");
+async function loadWeekly(gids: Map<string, string>): Promise<WeeklyEntry[]> {
+  const rows = await fetchTabRows("Weekly Programs", gids);
   const entries: WeeklyEntry[] = [];
   for (const row of rows) {
     const studentId = get(row, "Student ID");
@@ -190,7 +222,8 @@ export const cache: OrgCache = {
 
 export async function refresh(): Promise<void> {
   try {
-    const [admins, roster, weekly] = await Promise.all([loadAdmins(), loadRoster(), loadWeekly()]);
+    const gids = await fetchTabGids();
+    const [admins, roster, weekly] = await Promise.all([loadAdmins(gids), loadRoster(gids), loadWeekly(gids)]);
     cache.admins = admins;
     cache.roster = roster;
     cache.weekly = weekly;

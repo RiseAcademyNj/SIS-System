@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: sis-server
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build --workspace=server
+    startCommand: npm run start --workspace=server
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: CLIENT_ORIGIN
+        sync: false
+      - key: POLL_INTERVAL_MS
+        value: "5000"
+      # Fallback if config/sheet-link.txt isn't committed to this deploy's repo.
+      - key: SHEET_LINK
+        sync: false
